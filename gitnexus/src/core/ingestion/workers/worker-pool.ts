@@ -1259,12 +1259,18 @@ export const createWorkerPool = (
           worker.removeListener('messageerror', messageErrorHandler);
         };
 
+        // Jitter the wakeIdleSlots call to avoid a thundering-herd livelock
+        // on V8's message-port receive-side handle when many workers complete
+        // sub-batches simultaneously. setImmediate defers to the next event-loop
+        // iteration, breaking the synchronous call chain that hammers the futex
+        // on the worker-pool manager's heap (strace: futex(WAIT)→EAGAIN→WAIT).
         const finishJob = () => {
           activeWorkers--;
           busySlots.delete(workerIndex);
           inFlightProgress[workerIndex] = 0;
           runWorker(workerIndex);
           maybeDone();
+          setImmediate(() => wakeIdleSlots());
         };
 
         // Recover-and-resume flow shared by all in-pool worker death sites
