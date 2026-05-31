@@ -8,7 +8,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { createFieldRegistry } from '../../../src/core/ingestion/model/field-registry.js';
-import type { SymbolDefinition } from '../../../src/core/ingestion/model/symbol-table.js';
+import type { SymbolDefinition } from 'gitnexus-shared';
 import { makeDef as makeBaseDef } from './helpers.js';
 
 const makeDef = (overrides: Partial<SymbolDefinition> = {}): SymbolDefinition =>
@@ -41,15 +41,16 @@ describe('FieldRegistry', () => {
     expect(reg.lookupFieldByOwner('class:Order', 'name')?.nodeId).toBe('prop:Order.name');
   });
 
-  it('last-wins on duplicate (ownerNodeId, fieldName) — registry is flat, not an overload list', () => {
+  it('accumulates multiple defs under the same (ownerNodeId, fieldName)', () => {
     const reg = createFieldRegistry();
-    const first = makeDef({ nodeId: 'prop:User.name#first' });
-    const second = makeDef({ nodeId: 'prop:User.name#second' });
+    const first = makeDef({ nodeId: 'prop:User.name#first', type: 'Property' });
+    const second = makeDef({ nodeId: 'def:User.name#var', type: 'Variable' });
 
     reg.register('class:User', 'name', first);
     reg.register('class:User', 'name', second);
 
-    expect(reg.lookupFieldByOwner('class:User', 'name')?.nodeId).toBe('prop:User.name#second');
+    expect(reg.lookupFieldByOwner('class:User', 'name')?.nodeId).toBe('prop:User.name#first');
+    expect(reg.lookupAllByOwner('class:User', 'name')).toEqual([first, second]);
   });
 
   it('clear() empties the registry', () => {

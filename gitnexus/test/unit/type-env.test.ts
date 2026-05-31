@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { buildTypeEnv, type TypeEnvironment } from '../../src/core/ingestion/type-env.js';
 import { BindingAccumulator } from '../../src/core/ingestion/binding-accumulator.js';
-import { type SymbolDefinition } from '../../src/core/ingestion/model/symbol-table.js';
+import { type SymbolDefinition } from 'gitnexus-shared';
 import {
   createSemanticModel,
   type SemanticModel,
@@ -2893,6 +2893,24 @@ class User : BaseModel<string> {
       // Explicit annotation resolves it — no unverified binding needed
       expect(flatGet(typeEnv, 'user')).toBe('User');
       expect(typeEnv.constructorBindings.find((b) => b.varName === 'user')).toBeUndefined();
+    });
+
+    describeSwift('Swift constructor binding scanner', () => {
+      it('returns constructor binding for explicit User.init(...) calls', () => {
+        const tree = parseSwift(`
+func run() {
+  let user = User.init(name: "alice")
+}
+`);
+        const typeEnv = buildTypeEnv(tree, 'swift');
+        expect(flatGet(typeEnv, 'user')).toBeUndefined();
+        expect(typeEnv.constructorBindings).toEqual([
+          expect.objectContaining({
+            varName: 'user',
+            calleeName: 'User',
+          }),
+        ]);
+      });
     });
 
     it('returns constructor bindings for Python x = UnknownClass()', () => {

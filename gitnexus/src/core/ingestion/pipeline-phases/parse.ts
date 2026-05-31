@@ -20,15 +20,18 @@ import type { PipelinePhase, PipelineContext, PhaseResult } from './types.js';
 import { getPhaseOutput } from './types.js';
 import type { StructureOutput } from './structure.js';
 import type { BindingAccumulator } from '../binding-accumulator.js';
+import type { ParsedFile } from 'gitnexus-shared';
 import type {
   ExtractedFetchCall,
   ExtractedRoute,
   ExtractedDecoratorRoute,
   ExtractedToolDef,
   ExtractedORMQuery,
+  FetchWrapperDef,
 } from '../workers/parse-worker.js';
 import type { createResolutionContext } from '../model/resolution-context.js';
 import { runChunkedParseAndResolve } from './parse-impl.js';
+import type { ASTCache } from '../ast-cache.js';
 
 export interface ParseOutput {
   /**
@@ -43,6 +46,7 @@ export interface ParseOutput {
    */
   readonly exportedTypeMap: ReadonlyMap<string, ReadonlyMap<string, string>>;
   readonly allFetchCalls: readonly ExtractedFetchCall[];
+  readonly allFetchWrapperDefs: readonly FetchWrapperDef[];
   readonly allExtractedRoutes: readonly ExtractedRoute[];
   readonly allDecoratorRoutes: readonly ExtractedDecoratorRoute[];
   readonly allToolDefs: readonly ExtractedToolDef[];
@@ -56,6 +60,43 @@ export interface ParseOutput {
   readonly allPathSet: ReadonlySet<string>;
   /** Pass-through: total file count for progress reporting. */
   totalFiles: number;
+  /**
+   * True if the parse phase spawned a live worker pool for this run.
+   * False means every chunk ran through the sequential fallback (skipWorkers,
+   * thresholds not met, or pool-creation failure). Primarily a test affordance:
+   * see `PipelineOptions.workerThresholdsForTest`.
+   */
+  readonly usedWorkerPool: boolean;
+  /**
+   * Cross-phase tree-sitter Tree cache populated by the sequential
+   * parse path. Separate from the chunk-local `astCache` used *inside*
+   * the parse phase (which is cleared between chunks) — this one
+   * survives the whole phase and hands Trees to scope-resolution so
+   * it can skip a second parse.
+   *
+   * Empty entries for files that ran through the worker pool
+   * (workers can't return native tree-sitter Trees across the
+   * MessageChannel). Cache miss is safe — consumers fall back to a
+   * fresh parse. See plan
+   * docs/plans/2026-04-20-002-perf-parse-heritage-mro-plan.md (Unit 4).
+   *
+   * Disposed by `scopeResolutionPhase` (the sole consumer) via
+   * `scopeTreeCache.clear()` after its extract loop finishes.
+   */
+  readonly scopeTreeCache: ASTCache;
+  /**
+   * Per-file `ParsedFile` artifacts produced by workers' calls to
+   * `extractParsedFile`. Threaded through to `scopeResolutionPhase`
+   * as a re-extraction cache: when a file's ParsedFile is present here,
+   * scope-resolution can skip its own `extractParsedFile` (which would
+   * otherwise re-parse the file with tree-sitter on the main thread,
+   * costing ~58s on a 1000-file repo).
+   *
+   * Empty for files that went through the sequential parse fallback —
+   * sequential doesn't emit ParsedFile artifacts; scope-resolution
+   * falls back to a fresh extract for those.
+   */
+  readonly parsedFiles: readonly ParsedFile[];
 }
 
 export const parsePhase: PipelinePhase<ParseOutput> = {

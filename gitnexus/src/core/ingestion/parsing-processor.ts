@@ -1,19 +1,20 @@
-import type { GraphNode, GraphRelationship, NodeLabel } from 'gitnexus-shared';
+import type { GraphNode, GraphRelationship, NodeLabel, ParameterTypeClass } from 'gitnexus-shared';
 import { KnowledgeGraph } from '../graph/types.js';
 import Parser from 'tree-sitter';
 import { loadParser, loadLanguage, isLanguageAvailable } from '../tree-sitter/parser-loader.js';
 import { getProvider } from './languages/index.js';
 import { generateId } from '../../lib/utils.js';
-import type { SymbolTableReader, SymbolTableWriter } from './model/symbol-table.js';
-// SymbolTableReader is used for the FieldExtractorContext stub; the
-// parsing functions themselves need Writer because they call .add().
+import type { SymbolTableReader, SymbolTableWriter, ExtractedHeritage } from './model/index.js';
 import { ASTCache } from './ast-cache.js';
 import { getLanguageFromFilename, SupportedLanguages } from 'gitnexus-shared';
 import { extractVueScript, isVueSetupTopLevel } from './vue-sfc-extractor.js';
 import { yieldToEventLoop } from './utils/event-loop.js';
+import { parseSourceSafe } from '../tree-sitter/safe-parse.js';
+import { isVerboseIngestionEnabled } from './utils/verbose.js';
 import {
   getDefinitionNodeFromCaptures,
   findEnclosingClassInfo,
+  findObjectLiteralBindingInfo,
   getLabelFromCaptures,
   CLASS_CONTAINER_TYPES,
   type SyntaxNode,
@@ -29,9 +30,17 @@ import {
   typeTagForId,
   constTagForId,
   buildCollisionGroups,
+  parameterShapeIdTag,
 } from './utils/method-props.js';
+import {
+  extractTemplateArguments,
+  templateArgumentsIdTag,
+  templateConstraintsIdTag,
+} from './utils/template-arguments.js';
 import type { LanguageProvider } from './language-provider.js';
+import type { ParsedFile } from 'gitnexus-shared';
 import { WorkerPool } from './workers/worker-pool.js';
+import { logger } from '../logger.js';
 import type {
   ParseWorkerResult,
   ParseWorkerInput,
@@ -45,9 +54,18 @@ import type {
   FileConstructorBindings,
   FileScopeBindings,
   ExtractedORMQuery,
+  FetchWrapperDef,
 } from './workers/parse-worker.js';
-import type { ExtractedHeritage } from './model/heritage-map.js';
-import { getTreeSitterBufferSize, TREE_SITTER_MAX_BUFFER } from './constants.js';
+import type {
+  ExtractedRouterImport,
+  ExtractedRouterInclude,
+  ExtractedRouterModuleAlias,
+} from './route-extractors/fastapi-router-bindings.js';
+import {
+  getTreeSitterBufferSize,
+  getTreeSitterContentByteLength,
+  TREE_SITTER_MAX_BUFFER,
+} from './constants.js';
 
 export type FileProgressCallback = (current: number, total: number, filePath: string) => void;
 
@@ -58,16 +76,124 @@ export interface WorkerExtractedData {
   heritage: ExtractedHeritage[];
   routes: ExtractedRoute[];
   fetchCalls: ExtractedFetchCall[];
+  fetchWrapperDefs: FetchWrapperDef[];
   decoratorRoutes: ExtractedDecoratorRoute[];
+  routerIncludes: ExtractedRouterInclude[];
+  routerImports: ExtractedRouterImport[];
+  routerModuleAliases: ExtractedRouterModuleAlias[];
   toolDefs: ExtractedToolDef[];
   ormQueries: ExtractedORMQuery[];
   constructorBindings: FileConstructorBindings[];
   fileScopeBindings: FileScopeBindings[];
+  /**
+   * Per-file `ParsedFile` artifacts from the new scope-based resolution
+   * pipeline (RFC #909 Ring 2). Empty until a provider implements
+   * `emitScopeCaptures` — additive to the legacy DAG path. Aggregated
+   * from every worker chunk; consumed downstream by #921's
+   * finalize-orchestrator.
+   */
+  parsedFiles: ParsedFile[];
 }
 
 // ============================================================================
 // Worker-based parallel parsing
 // ============================================================================
+
+/**
+ * Merge a list of `ParseWorkerResult`s into the running graph + symbol
+ * table state and produce the chunk-aggregated `WorkerExtractedData`.
+ *
+ * Extracted from `processParsingWithWorkers` so the same merge logic can
+ * be applied to both freshly-parsed worker output AND cached worker
+ * output replayed during incremental analyze. Idempotent on the
+ * accumulator fields (push-only); idempotent on graph if the caller
+ * starts from a clean graph (otherwise duplicate `addNode` calls are
+ * silently no-op'd by `KnowledgeGraph`).
+ */
+export const mergeChunkResults = (
+  graph: KnowledgeGraph,
+  symbolTable: SymbolTableWriter,
+  chunkResults: readonly ParseWorkerResult[],
+): WorkerExtractedData => {
+  const allImports: ExtractedImport[] = [];
+  const allCalls: ExtractedCall[] = [];
+  const allAssignments: ExtractedAssignment[] = [];
+  const allHeritage: ExtractedHeritage[] = [];
+  const allRoutes: ExtractedRoute[] = [];
+  const allFetchCalls: ExtractedFetchCall[] = [];
+  const allFetchWrapperDefs: FetchWrapperDef[] = [];
+  const allDecoratorRoutes: ExtractedDecoratorRoute[] = [];
+  const allRouterIncludes: ExtractedRouterInclude[] = [];
+  const allRouterImports: ExtractedRouterImport[] = [];
+  const allRouterModuleAliases: ExtractedRouterModuleAlias[] = [];
+  const allToolDefs: ExtractedToolDef[] = [];
+  const allORMQueries: ExtractedORMQuery[] = [];
+  const allConstructorBindings: FileConstructorBindings[] = [];
+  const fileScopeBindingsByFile: FileScopeBindings[] = [];
+  const allParsedFiles: ParsedFile[] = [];
+
+  for (const result of chunkResults) {
+    for (const node of result.nodes) {
+      graph.addNode({
+        id: node.id,
+        label: node.label as NodeLabel,
+        properties: node.properties,
+      });
+    }
+    for (const rel of result.relationships) {
+      graph.addRelationship(rel);
+    }
+    for (const sym of result.symbols) {
+      symbolTable.add(sym.filePath, sym.name, sym.nodeId, sym.type, {
+        parameterCount: sym.parameterCount,
+        requiredParameterCount: sym.requiredParameterCount,
+        parameterTypes: sym.parameterTypes,
+        parameterTypeClasses: sym.parameterTypeClasses,
+        returnType: sym.returnType,
+        declaredType: sym.declaredType,
+        templateArguments: sym.templateArguments,
+        ownerId: sym.ownerId,
+        qualifiedName: sym.qualifiedName,
+      });
+    }
+    for (const item of result.imports) allImports.push(item);
+    for (const item of result.calls) allCalls.push(item);
+    for (const item of result.assignments) allAssignments.push(item);
+    for (const item of result.heritage) allHeritage.push(item);
+    for (const item of result.routes) allRoutes.push(item);
+    for (const item of result.fetchCalls) allFetchCalls.push(item);
+    for (const item of result.fetchWrapperDefs ?? []) allFetchWrapperDefs.push(item);
+    for (const item of result.decoratorRoutes) allDecoratorRoutes.push(item);
+    for (const item of result.routerIncludes ?? []) allRouterIncludes.push(item);
+    for (const item of result.routerImports ?? []) allRouterImports.push(item);
+    for (const item of result.routerModuleAliases ?? []) allRouterModuleAliases.push(item);
+    for (const item of result.toolDefs) allToolDefs.push(item);
+    if (result.ormQueries) for (const item of result.ormQueries) allORMQueries.push(item);
+    for (const item of result.constructorBindings) allConstructorBindings.push(item);
+    if (result.fileScopeBindings)
+      for (const item of result.fileScopeBindings) fileScopeBindingsByFile.push(item);
+    if (result.parsedFiles) for (const item of result.parsedFiles) allParsedFiles.push(item);
+  }
+
+  return {
+    imports: allImports,
+    calls: allCalls,
+    assignments: allAssignments,
+    heritage: allHeritage,
+    routes: allRoutes,
+    fetchCalls: allFetchCalls,
+    fetchWrapperDefs: allFetchWrapperDefs,
+    decoratorRoutes: allDecoratorRoutes,
+    routerIncludes: allRouterIncludes,
+    routerImports: allRouterImports,
+    routerModuleAliases: allRouterModuleAliases,
+    toolDefs: allToolDefs,
+    ormQueries: allORMQueries,
+    constructorBindings: allConstructorBindings,
+    fileScopeBindings: fileScopeBindingsByFile,
+    parsedFiles: allParsedFiles,
+  };
+};
 
 const processParsingWithWorkers = async (
   graph: KnowledgeGraph,
@@ -76,6 +202,14 @@ const processParsingWithWorkers = async (
   astCache: ASTCache,
   workerPool: WorkerPool,
   onFileProgress?: FileProgressCallback,
+  /**
+   * When provided, populated with the raw worker results before merging.
+   * Used by the incremental-indexing parse cache to capture the per-chunk
+   * worker output for caching across runs. The mutation happens in-place
+   * so the caller (parse-impl) can keep a reference. See
+   * `gitnexus/src/storage/parse-cache.ts`.
+   */
+  outRawResults?: ParseWorkerResult[],
 ): Promise<WorkerExtractedData> => {
   // Filter to parseable files only
   const parseableFiles: ParseWorkerInput[] = [];
@@ -92,11 +226,16 @@ const processParsingWithWorkers = async (
       heritage: [],
       routes: [],
       fetchCalls: [],
+      fetchWrapperDefs: [],
       decoratorRoutes: [],
+      routerIncludes: [],
+      routerImports: [],
+      routerModuleAliases: [],
       toolDefs: [],
       ormQueries: [],
       constructorBindings: [],
       fileScopeBindings: [],
+      parsedFiles: [],
     };
 
   const total = files.length;
@@ -109,56 +248,15 @@ const processParsingWithWorkers = async (
     },
   );
 
-  // Merge results from all workers into graph and symbol table
-  const allImports: ExtractedImport[] = [];
-  const allCalls: ExtractedCall[] = [];
-  const allAssignments: ExtractedAssignment[] = [];
-  const allHeritage: ExtractedHeritage[] = [];
-  const allRoutes: ExtractedRoute[] = [];
-  const allFetchCalls: ExtractedFetchCall[] = [];
-  const allDecoratorRoutes: ExtractedDecoratorRoute[] = [];
-  const allToolDefs: ExtractedToolDef[] = [];
-  const allORMQueries: ExtractedORMQuery[] = [];
-  const allConstructorBindings: FileConstructorBindings[] = [];
-  const fileScopeBindingsByFile: FileScopeBindings[] = [];
-  for (const result of chunkResults) {
-    for (const node of result.nodes) {
-      graph.addNode({
-        id: node.id,
-        label: node.label as NodeLabel,
-        properties: node.properties,
-      });
-    }
-
-    for (const rel of result.relationships) {
-      graph.addRelationship(rel);
-    }
-
-    for (const sym of result.symbols) {
-      symbolTable.add(sym.filePath, sym.name, sym.nodeId, sym.type, {
-        parameterCount: sym.parameterCount,
-        requiredParameterCount: sym.requiredParameterCount,
-        parameterTypes: sym.parameterTypes,
-        returnType: sym.returnType,
-        declaredType: sym.declaredType,
-        ownerId: sym.ownerId,
-        qualifiedName: sym.qualifiedName,
-      });
-    }
-
-    for (const item of result.imports) allImports.push(item);
-    for (const item of result.calls) allCalls.push(item);
-    for (const item of result.assignments) allAssignments.push(item);
-    for (const item of result.heritage) allHeritage.push(item);
-    for (const item of result.routes) allRoutes.push(item);
-    for (const item of result.fetchCalls) allFetchCalls.push(item);
-    for (const item of result.decoratorRoutes) allDecoratorRoutes.push(item);
-    for (const item of result.toolDefs) allToolDefs.push(item);
-    if (result.ormQueries) for (const item of result.ormQueries) allORMQueries.push(item);
-    for (const item of result.constructorBindings) allConstructorBindings.push(item);
-    if (result.fileScopeBindings)
-      for (const item of result.fileScopeBindings) fileScopeBindingsByFile.push(item);
+  // Capture the raw chunk results for the incremental parse cache before
+  // merging — the cache stores the unmerged worker output so a future run
+  // can re-merge them into a fresh graph state.
+  if (outRawResults) {
+    for (const r of chunkResults) outRawResults.push(r);
   }
+
+  // Merge results from all workers into graph and symbol table.
+  const merged = mergeChunkResults(graph, symbolTable, chunkResults);
 
   // Merge and log skipped languages from workers
   const skippedLanguages = new Map<string, number>();
@@ -171,24 +269,12 @@ const processParsingWithWorkers = async (
     const summary = Array.from(skippedLanguages.entries())
       .map(([lang, count]) => `${lang}: ${count}`)
       .join(', ');
-    console.warn(`  Skipped unsupported languages: ${summary}`);
+    logger.warn(`  Skipped unsupported languages: ${summary}`);
   }
 
   // Final progress
   onFileProgress?.(total, total, 'done');
-  return {
-    imports: allImports,
-    calls: allCalls,
-    assignments: allAssignments,
-    heritage: allHeritage,
-    routes: allRoutes,
-    fetchCalls: allFetchCalls,
-    decoratorRoutes: allDecoratorRoutes,
-    toolDefs: allToolDefs,
-    ormQueries: allORMQueries,
-    constructorBindings: allConstructorBindings,
-    fileScopeBindings: fileScopeBindingsByFile,
-  };
+  return merged;
 };
 
 // ============================================================================
@@ -302,11 +388,13 @@ const processParsingSequential = async (
   files: { path: string; content: string }[],
   symbolTable: SymbolTableWriter,
   astCache: ASTCache,
+  scopeTreeCache: ASTCache | undefined,
   onFileProgress?: FileProgressCallback,
 ) => {
   const parser = await loadParser();
   const total = files.length;
-  const skippedLanguages = new Map<string, number>();
+  const logSkipped = isVerboseIngestionEnabled();
+  const skippedByLang = logSkipped ? new Map<string, number>() : null;
 
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
@@ -325,15 +413,15 @@ const processParsingSequential = async (
     const language = getLanguageFromFilename(file.path);
 
     if (!language) continue;
-
-    // Skip unsupported languages (e.g. Swift when tree-sitter-swift not installed)
     if (!isLanguageAvailable(language)) {
-      skippedLanguages.set(language, (skippedLanguages.get(language) || 0) + 1);
+      if (skippedByLang) {
+        skippedByLang.set(language, (skippedByLang.get(language) ?? 0) + 1);
+      }
       continue;
     }
 
     // Skip files larger than the max tree-sitter buffer (32 MB)
-    if (file.content.length > TREE_SITTER_MAX_BUFFER) continue;
+    if (getTreeSitterContentByteLength(file.content) > TREE_SITTER_MAX_BUFFER) continue;
 
     // Vue SFC preprocessing: extract <script> block content
     let parseContent = file.content;
@@ -347,38 +435,50 @@ const processParsingSequential = async (
       isVueSetup = extracted.isSetup;
     }
 
+    // Per-language source-text transform (e.g., UE macro stripping for C++).
+    // Length-preserving — see LanguageProvider.preprocessSource contract.
+    parseContent =
+      getProvider(language).preprocessSource?.(parseContent, file.path) ?? parseContent;
+
     try {
       await loadLanguage(language, file.path);
     } catch {
       continue; // parser unavailable — safety net
     }
 
-    let tree;
+    let tree: Parser.Tree;
     try {
-      tree = parser.parse(parseContent, undefined, {
-        bufferSize: getTreeSitterBufferSize(parseContent.length),
+      tree = parseSourceSafe(parser, parseContent, undefined, {
+        bufferSize: getTreeSitterBufferSize(parseContent),
       });
     } catch (parseError) {
-      console.warn(`Skipping unparseable file: ${file.path}`);
+      logger.warn(`Skipping unparseable file: ${file.path}`);
       continue;
     }
 
     astCache.set(file.path, tree);
 
     const provider = getProvider(language);
+    // Mirror into the cross-phase cache only when the language has a
+    // scope-resolution consumer — otherwise we retain Trees no one
+    // reads. parse-impl clears `astCache` between chunks;
+    // `scopeTreeCache` survives until scope-resolution disposes it.
+    if (provider.emitScopeCaptures !== undefined) {
+      scopeTreeCache?.set(file.path, tree);
+    }
     const queryString = provider.treeSitterQueries;
     if (!queryString) {
       continue;
     }
 
-    let query;
-    let matches;
+    let query: Parser.Query;
+    let matches: Parser.QueryMatch[];
     try {
       const language = parser.getLanguage();
       query = new Parser.Query(language, queryString);
       matches = query.matches(tree.rootNode);
     } catch (queryError) {
-      console.warn(`Query error for ${file.path}:`, queryError);
+      logger.warn({ queryError }, `Query error for ${file.path}:`);
       continue;
     }
 
@@ -418,6 +518,23 @@ const processParsingSequential = async (
             })
           : null;
       const nodeLabel = extractedClassSymbol?.type ?? defaultNodeLabel;
+      const isClassLikeLabel =
+        nodeLabel === 'Class' ||
+        nodeLabel === 'Struct' ||
+        nodeLabel === 'Interface' ||
+        nodeLabel === 'Enum' ||
+        nodeLabel === 'Record';
+      if (
+        isClassLikeLabel &&
+        provider.classExtractor?.shouldSkipClassCapture?.({
+          captureMap,
+          definitionNode,
+          nameNode,
+          nodeLabel,
+        }) === true
+      ) {
+        return;
+      }
       // Synthesize name for constructors without explicit @name capture (e.g. Swift init)
       if (!nameNode && nodeLabel !== 'Constructor' && !extractedClassSymbol) return;
       const nodeName = extractedClassSymbol?.name ?? (nameNode ? nameNode.text : 'init');
@@ -442,6 +559,10 @@ const processParsingSequential = async (
           )
         : null;
       const enclosingClassId = enclosingClassInfo?.classId ?? null;
+      const objectLiteralOwnerInfo =
+        !enclosingClassId && nodeLabel === 'Method' && definitionNode
+          ? findObjectLiteralBindingInfo(definitionNode, file.path)
+          : null;
 
       // Qualify method/property IDs with enclosing class name to avoid collisions
       // e.g. "Method:animal.dart:Animal.speak" vs "Method:animal.dart:Dog.speak"
@@ -512,10 +633,13 @@ const processParsingSequential = async (
         }
       }
 
-      // Append #<paramCount> to Method/Constructor IDs to disambiguate overloads.
-      // Functions are not suffixed — they don't overload by name in the same scope.
+      // Append #<paramCount> to owned callable IDs to disambiguate overloads.
+      // Top-level Function IDs stay stable; functions inside an owner may overload.
       // When same-arity collisions exist, append ~type1,type2 for further disambiguation.
-      const needsAritySuffix = nodeLabel === 'Method' || nodeLabel === 'Constructor';
+      const needsAritySuffix =
+        nodeLabel === 'Method' ||
+        nodeLabel === 'Constructor' ||
+        (nodeLabel === 'Function' && enclosingClassId !== null);
       let arityTag = needsAritySuffix && arityForId !== undefined ? `#${arityForId}` : '';
       if (arityTag && seqDefMethods && seqDefMethodInfo && seqClassNodeId !== undefined) {
         // Use cached method map + collision groups (built once per class, not per method)
@@ -542,7 +666,67 @@ const processParsingSequential = async (
           cached.groups,
         );
       }
-      const nodeId = generateId(nodeLabel, `${file.path}:${qualifiedName}${arityTag}`);
+      const parameterShapeTag =
+        nodeLabel === 'Function' || nodeLabel === 'Method'
+          ? parameterShapeIdTag(
+              methodProps.parameterTypes as string[] | undefined,
+              methodProps.parameterTypeClasses as ParameterTypeClass[] | undefined,
+            )
+          : '';
+      const classTemplateArguments =
+        extractedClassSymbol?.templateArguments ??
+        provider.classExtractor?.extractTemplateArgumentsFromCapture?.({
+          captureMap,
+          definitionNode,
+          nameNode,
+        }) ??
+        (captureMap['template-arguments']
+          ? extractTemplateArguments(captureMap['template-arguments'].text)
+          : undefined) ??
+        (nameNode && nameNode.text ? extractTemplateArguments(nameNode.text) : undefined);
+      const classTemplateTag =
+        (nodeLabel === 'Class' ||
+          nodeLabel === 'Struct' ||
+          nodeLabel === 'Interface' ||
+          nodeLabel === 'Enum' ||
+          nodeLabel === 'Record') &&
+        classTemplateArguments !== undefined &&
+        classTemplateArguments.length > 0
+          ? templateArgumentsIdTag(classTemplateArguments)
+          : '';
+      // SFINAE / `requires`-clause aware ID disambiguation (issue #1579).
+      // Function-template overloads with identical parameterTypes but
+      // mutually-exclusive constraints (e.g. `enable_if_t<is_integral_v<T>>`
+      // vs `enable_if_t<is_floating_point_v<T>>`) need distinct graph
+      // nodes so the constraint-filter step in `narrowOverloadCandidates`
+      // has two candidates to narrow between. Without this tag they
+      // collapse to a single Function node and the SFINAE call resolves
+      // to only one edge regardless of which overload's constraint holds.
+      // The provider hook is the right invocation point — parsing-processor
+      // sees raw tree-sitter matches without the `@`-prefixed synthetic
+      // captures `scope-extractor` consumes, so we delegate extraction to
+      // the language adapter (C++ implements this; other languages opt out).
+      let parsedTemplateConstraints: unknown = undefined;
+      let constraintsTag = '';
+      if (
+        (nodeLabel === 'Function' || nodeLabel === 'Method') &&
+        provider.extractTemplateConstraints !== undefined &&
+        definitionNode !== null
+      ) {
+        try {
+          parsedTemplateConstraints = provider.extractTemplateConstraints(definitionNode);
+          if (parsedTemplateConstraints !== undefined) {
+            constraintsTag = templateConstraintsIdTag(parsedTemplateConstraints);
+          }
+        } catch {
+          parsedTemplateConstraints = undefined;
+          constraintsTag = '';
+        }
+      }
+      const nodeId = generateId(
+        nodeLabel,
+        `${file.path}:${qualifiedName}${classTemplateTag}${arityTag}${constraintsTag}${parameterShapeTag}`,
+      );
       const classNodeForSymbol = definitionNodeForRange || definitionNode || nameNode;
       const qualifiedTypeName =
         extractedClassSymbol?.qualifiedName ??
@@ -575,6 +759,12 @@ const processParsingSequential = async (
                   nodeName,
                 ),
           ...(qualifiedTypeName !== undefined ? { qualifiedName: qualifiedTypeName } : {}),
+          ...(classTemplateArguments !== undefined && classTemplateArguments.length > 0
+            ? { templateArguments: classTemplateArguments }
+            : {}),
+          ...(parsedTemplateConstraints !== undefined
+            ? { templateConstraints: parsedTemplateConstraints }
+            : {}),
           ...(frameworkHint
             ? {
                 astFrameworkMultiplier: frameworkHint.entryPointMultiplier,
@@ -630,9 +820,11 @@ const processParsingSequential = async (
         parameterCount: methodProps.parameterCount as number | undefined,
         requiredParameterCount: methodProps.requiredParameterCount as number | undefined,
         parameterTypes: methodProps.parameterTypes as string[] | undefined,
+        parameterTypeClasses: methodProps.parameterTypeClasses as ParameterTypeClass[] | undefined,
         returnType: methodProps.returnType as string | undefined,
         declaredType,
-        ownerId: enclosingClassId ?? undefined,
+        templateArguments: classTemplateArguments,
+        ownerId: enclosingClassId ?? objectLiteralOwnerInfo?.ownerId ?? undefined,
         qualifiedName: qualifiedTypeName,
       });
 
@@ -652,25 +844,29 @@ const processParsingSequential = async (
       graph.addRelationship(relationship);
 
       // ── HAS_METHOD / HAS_PROPERTY: link member to enclosing class ──
-      if (enclosingClassId) {
+      const ownerIdForMemberEdge = enclosingClassId ?? objectLiteralOwnerInfo?.ownerId ?? null;
+      if (ownerIdForMemberEdge) {
         const memberEdgeType = nodeLabel === 'Property' ? 'HAS_PROPERTY' : 'HAS_METHOD';
         graph.addRelationship({
-          id: generateId(memberEdgeType, `${enclosingClassId}->${nodeId}`),
-          sourceId: enclosingClassId,
+          id: generateId(memberEdgeType, `${ownerIdForMemberEdge}->${nodeId}`),
+          sourceId: ownerIdForMemberEdge,
           targetId: nodeId,
           type: memberEdgeType,
           confidence: 1.0,
-          reason: '',
+          reason: objectLiteralOwnerInfo
+            ? 'object literal method belongs to exported object binding'
+            : '',
         });
       }
     });
   }
 
-  if (skippedLanguages.size > 0) {
-    const summary = Array.from(skippedLanguages.entries())
-      .map(([lang, count]) => `${lang}: ${count}`)
-      .join(', ');
-    console.warn(`  Skipped unsupported languages: ${summary}`);
+  if (skippedByLang && skippedByLang.size > 0) {
+    for (const [lang, count] of skippedByLang.entries()) {
+      logger.warn(
+        `[ingestion] Skipped ${count} ${lang} file(s) in parsing processing — ${lang} parser not available.`,
+      );
+    }
   }
 };
 
@@ -678,33 +874,135 @@ const processParsingSequential = async (
 // Public API
 // ============================================================================
 
+/**
+ * Per-`WorkerPool` log-dedup state for quarantine reporting. Keyed on the
+ * pool instance so multiple concurrent pools (test fixtures, future
+ * multi-pool callers) each get their own seen-set. WeakMap entries vanish
+ * when the pool is garbage-collected.
+ */
+const loggedQuarantineByPool = new WeakMap<WorkerPool, Set<string>>();
+
 export const processParsing = async (
   graph: KnowledgeGraph,
   files: { path: string; content: string }[],
   symbolTable: SymbolTableWriter,
   astCache: ASTCache,
+  /**
+   * Persistent tree cache (separate from `astCache`, which the caller
+   * clears between chunks). Sequential parses additionally write the
+   * Tree here so cross-phase consumers (scope-resolution) can read it.
+   * Worker-mode parses skip — Trees can't cross MessageChannels.
+   * Pass `undefined` if no consumer needs cross-phase access.
+   */
+  scopeTreeCache: ASTCache | undefined,
   onFileProgress?: FileProgressCallback,
   workerPool?: WorkerPool,
+  /**
+   * Optional out-parameter for the incremental parse cache. When
+   * provided AND the worker-pool path runs successfully, populated
+   * with the raw `ParseWorkerResult[]` from the workers (pre-merge).
+   * Stays empty for the sequential fallback path (no per-chunk
+   * artifact to cache there). See `gitnexus/src/storage/parse-cache.ts`.
+   */
+  outRawResults?: ParseWorkerResult[],
 ): Promise<WorkerExtractedData | null> => {
+  let lastProgress = 0;
+  const reportProgress: FileProgressCallback | undefined = onFileProgress
+    ? (current, total, detail) => {
+        lastProgress = Math.max(lastProgress, current);
+        onFileProgress(lastProgress, total, detail);
+      }
+    : undefined;
+
   if (workerPool) {
-    try {
-      return await processParsingWithWorkers(
-        graph,
-        files,
-        symbolTable,
-        astCache,
-        workerPool,
-        onFileProgress,
-      );
-    } catch (err) {
-      console.warn(
-        'Worker pool parsing failed, falling back to sequential:',
-        err instanceof Error ? err.message : err,
+    if (scopeTreeCache !== undefined && process.env.PROF_SCOPE_RESOLUTION === '1') {
+      // Trees can't cross MessageChannels, so worker-parsed files land
+      // in scope-resolution with an empty cache and get re-parsed.
+      // Surfacing this in PROF mode prevents silent perf cliffs when
+      // a repo crosses the worker-pool threshold.
+      logger.warn(
+        `[scope-resolution prof] worker pool engaged for ${files.length} files — cross-phase tree cache will be empty; scope-resolution re-parses.`,
       );
     }
+    // U20 design pivot: the worker pool's resilience layers
+    // (respawn budget, circuit breaker, quarantine, slot-attribution,
+    // cumulative timeout) are the SOLE contract for handling worker
+    // failures. There is no sequential-parser fallback for either
+    // partial quarantine or full pool failure — the operator must see
+    // a clear hard signal when workers can't recover, instead of a
+    // silently-degraded graph from a possibly-crashing main-thread
+    // sequential parser. A failing tree-sitter native binding that
+    // quarantined a worker would, under the previous design, re-trigger
+    // the same SIGSEGV on the main thread; we avoid that risk entirely.
+    //
+    // - Partial quarantine: the file is missing from this run's graph;
+    //   the per-chunk warn log below surfaces it; U2's chunk-cache
+    //   write-guard in parse-impl.ts keeps the chunk uncached so the
+    //   next analyze gets a cache miss and a fresh pool retries.
+    // - Full pool failure: `WorkerPoolDispatchError` propagates from
+    //   `processParsingWithWorkers` up through this function. The
+    //   analyze run errors out instead of falling back to sequential.
+    const data = await processParsingWithWorkers(
+      graph,
+      files,
+      symbolTable,
+      astCache,
+      workerPool,
+      reportProgress,
+      outRawResults,
+    );
+    // Session-scoped quarantine (worker-pool resilience Layer 3): surface
+    // any files this pool has decided are unsafe for workers so the
+    // operator can see what was skipped. The pool already filtered them
+    // out of dispatch; we only need to log + progress-report. Quarantine
+    // is session-scoped per pool instance — a fresh `createWorkerPool`
+    // call clears it.
+    //
+    // Dedup: log full path list only for entries newly quarantined since
+    // the previous dispatch on the same pool. The per-chunk progress
+    // message still surfaces the count for UX continuity, but the
+    // structured `quarantinedFiles` payload is only emitted when there
+    // is new signal — prevents O(quarantine × chunks) log spam.
+    const quarantineSnapshot = workerPool.getQuarantinedPaths?.() ?? [];
+    const quarantineSet = new Set(quarantineSnapshot);
+    if (quarantineSet.size > 0) {
+      const quarantinedInChunk = files.filter((file) => quarantineSet.has(file.path));
+      if (quarantinedInChunk.length > 0) {
+        const seenForPool = loggedQuarantineByPool.get(workerPool) ?? new Set<string>();
+        const newlyQuarantined = quarantinedInChunk
+          .map((file) => file.path)
+          .filter((p) => !seenForPool.has(p));
+        for (const p of newlyQuarantined) seenForPool.add(p);
+        loggedQuarantineByPool.set(workerPool, seenForPool);
+        if (newlyQuarantined.length > 0) {
+          logger.warn(
+            {
+              newlyQuarantined,
+              cumulativeQuarantine: quarantineSet.size,
+              chunkSkipped: quarantinedInChunk.length,
+            },
+            `Worker quarantine: ${newlyQuarantined.length} new file(s) skipped this chunk ` +
+              `(${quarantinedInChunk.length} skipped total, ${quarantineSet.size} cumulative).`,
+          );
+        }
+        reportProgress?.(
+          lastProgress,
+          files.length,
+          `${quarantinedInChunk.length} worker-quarantined file(s) skipped`,
+        );
+      }
+    }
+    return data;
   }
 
   // Fallback: sequential parsing (no pre-extracted data)
-  await processParsingSequential(graph, files, symbolTable, astCache, onFileProgress);
+  await processParsingSequential(
+    graph,
+    files,
+    symbolTable,
+    astCache,
+    scopeTreeCache,
+    reportProgress,
+  );
   return null;
 };

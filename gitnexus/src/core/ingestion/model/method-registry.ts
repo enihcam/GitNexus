@@ -7,7 +7,7 @@
  * (array values) and arity-based filtering.
  */
 
-import type { SymbolDefinition } from './symbol-table.js';
+import type { SymbolDefinition } from 'gitnexus-shared';
 
 // ---------------------------------------------------------------------------
 // Public read-only interface
@@ -48,6 +48,16 @@ export interface MethodRegistry {
    * allocation reachable from two indexes.
    */
   lookupMethodByName(name: string): readonly SymbolDefinition[];
+
+  /**
+   * Return every overload registered under `(ownerNodeId, methodName)`,
+   * unfiltered by arity or return type. This is the raw owner-scoped
+   * view — callers that need arity narrowing or unambiguous single-
+   * result semantics should use `lookupMethodByOwner` instead.
+   *
+   * Returns `[]` on miss so callers can iterate without null checks.
+   */
+  lookupAllByOwner(ownerNodeId: string, methodName: string): readonly SymbolDefinition[];
 
   /**
    * True iff at least one registered def has `type === 'Function'` — i.e.,
@@ -162,6 +172,13 @@ export const createMethodRegistry = (): MutableMethodRegistry => {
     return methodsByName.get(name) ?? EMPTY;
   };
 
+  const lookupAllByOwner = (
+    ownerNodeId: string,
+    methodName: string,
+  ): readonly SymbolDefinition[] => {
+    return methodByOwner.get(`${ownerNodeId}\0${methodName}`) ?? EMPTY;
+  };
+
   const register = (ownerNodeId: string, methodName: string, def: SymbolDefinition): void => {
     const key = `${ownerNodeId}\0${methodName}`;
     const existing = methodByOwner.get(key);
@@ -195,6 +212,7 @@ export const createMethodRegistry = (): MutableMethodRegistry => {
   return {
     lookupMethodByOwner,
     lookupMethodByName,
+    lookupAllByOwner,
     register,
     clear,
     get hasFunctionMethods() {

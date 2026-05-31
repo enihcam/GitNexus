@@ -15,6 +15,7 @@ import type { StructureOutput } from './structure.js';
 import { processCommunities, type CommunityDetectionResult } from '../community-processor.js';
 import { isDev } from '../utils/env.js';
 
+import { logger } from '../../logger.js';
 export interface CommunitiesOutput {
   communityResult: CommunityDetectionResult;
 }
@@ -31,13 +32,13 @@ export const communitiesPhase: PipelinePhase<CommunitiesOutput> = {
 
     ctx.onProgress({
       phase: 'communities',
-      percent: 84,
+      percent: 98,
       message: 'Detecting code communities...',
       stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: ctx.graph.nodeCount },
     });
 
     const communityResult = await processCommunities(ctx.graph, (message, progress) => {
-      const communityProgress = 84 + progress * 0.09;
+      const communityProgress = 98 + progress * 0.01;
       ctx.onProgress({
         phase: 'communities',
         percent: Math.round(communityProgress),
@@ -47,7 +48,7 @@ export const communitiesPhase: PipelinePhase<CommunitiesOutput> = {
     });
 
     if (isDev) {
-      console.log(
+      logger.info(
         `🏘️ Community detection: ${communityResult.stats.totalCommunities} communities found (modularity: ${communityResult.stats.modularity.toFixed(3)})`,
       );
     }

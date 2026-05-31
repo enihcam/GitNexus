@@ -44,6 +44,45 @@
  * direct `createSymbolTable()` caller (e.g. an isolated unit test) gets
  * the pure, registry-free behavior — no surprises, no hidden side
  * effects.
+ *
+ * ## Single-source-of-truth invariant
+ *
+ * `SemanticModel` is the authoritative symbol store for the whole
+ * ingestion pipeline. Both the legacy Call-Resolution DAG and the
+ * new scope-resolution pipeline read symbol-keyed lookups from here
+ * exclusively — no parallel owner-keyed, name-keyed, or file-keyed
+ * symbol indexes exist outside this module. The scope-resolution
+ * pipeline does carry a small `WorkspaceResolutionIndex` for
+ * `Scope`-valued maps (`classScopeByDefId`, `moduleScopeByFile`) that
+ * `SemanticModel` structurally cannot hold, but nothing else.
+ *
+ * ## Write / read phase contract
+ *
+ * Writes to the model happen in three clearly-ordered phases during a
+ * single ingestion run:
+ *
+ *   1. **Legacy parse phase** (`parsing-processor`) calls
+ *      `symbols.add(...)` per extracted symbol, which fans out via
+ *      the dispatch table into `types` / `methods` / `fields`.
+ *   2. **Scope-resolution reconciliation** (`reconcileOwnership` in
+ *      `scope-resolution/pipeline/reconcile-ownership.ts`) registers
+ *      any `parsed.localDefs[i]` with a scope-resolution-corrected
+ *      `ownerId` that the legacy pass missed (Python class-body
+ *      methods are the canonical case). Idempotent.
+ *   3. **Finalize-orchestrator** calls `attachScopeIndexes(...)` to
+ *      stamp the materialized `ScopeResolutionIndexes` bundle onto
+ *      `model.scopes`. One-shot; throws on a second call.
+ *
+ * After these three phases, the model is effectively frozen:
+ *   - `attachScopeIndexes` applied `Object.freeze` to its bundle.
+ *   - Downstream passes receive the narrowed `SemanticModel` reader
+ *     handle (not `MutableSemanticModel`), so `.register()` /
+ *     `.clear()` / `attachScopeIndexes()` are structurally absent.
+ *
+ * See `scope-resolution/contract/scope-resolver.ts` Contract
+ * Invariant I9 for the scope-resolution-side rule and
+ * `ARCHITECTURE.md` § "Semantic-model source of truth" for the
+ * overall architecture.
  */
 
 import type { NodeLabel } from 'gitnexus-shared';
@@ -53,14 +92,11 @@ import type { FieldRegistry, MutableFieldRegistry } from './field-registry.js';
 import { createTypeRegistry } from './type-registry.js';
 import { createMethodRegistry } from './method-registry.js';
 import { createFieldRegistry } from './field-registry.js';
-import type {
-  SymbolTableReader,
-  SymbolTableWriter,
-  SymbolDefinition,
-  AddMetadata,
-} from './symbol-table.js';
+import type { SymbolDefinition } from 'gitnexus-shared';
+import type { SymbolTableReader, SymbolTableWriter, AddMetadata } from './symbol-table.js';
 import { createSymbolTable } from './symbol-table.js';
 import { createRegistrationTable } from './registration-table.js';
+import type { ScopeResolutionIndexes } from './scope-resolution-indexes.js';
 
 // ---------------------------------------------------------------------------
 // Public read-only interface
@@ -87,6 +123,19 @@ export interface SemanticModel {
   readonly methods: MethodRegistry;
   readonly fields: FieldRegistry;
   readonly symbols: SymbolTableReader;
+  /**
+   * Materialized scope-resolution indexes from RFC #909 Ring 2 PKG #921.
+   *
+   * `undefined` until the finalize-orchestrator attaches them. While
+   * `undefined`, the legacy DAG is the sole resolution surface; once set,
+   * resolvers whose language has `REGISTRY_PRIMARY_<LANG>=true` consult
+   * these indexes instead.
+   *
+   * The attach is a one-shot write (see `MutableSemanticModel`). Callers
+   * holding a read-only `SemanticModel` handle see either `undefined` or
+   * the final frozen bundle — never a half-populated view.
+   */
+  readonly scopes?: ScopeResolutionIndexes;
 }
 
 // ---------------------------------------------------------------------------
@@ -104,6 +153,17 @@ export interface MutableSemanticModel extends SemanticModel {
   readonly symbols: SymbolTableWriter;
   /** Clear all registries AND the nested SymbolTable. */
   clear(): void;
+  /**
+   * Stamp the finalize-orchestrator's output onto this model.
+   *
+   * **One-shot write.** Throws when called a second time — the indexes are
+   * meant to be materialized once per ingestion run. `Object.freeze` is
+   * applied to the attached bundle so consumers cannot mutate after attach.
+   *
+   * `clear()` resets the attached bundle back to `undefined`, enabling a
+   * fresh re-ingestion to attach a new bundle.
+   */
+  attachScopeIndexes(indexes: ScopeResolutionIndexes): void;
 }
 
 // ---------------------------------------------------------------------------
@@ -156,6 +216,21 @@ export const createSemanticModel = (): MutableSemanticModel => {
     return def;
   };
 
+  // Scope-resolution bundle slot. Starts `undefined`; populated by a
+  // one-shot `attachScopeIndexes(...)` from the finalize-orchestrator.
+  // Held inside the factory closure so the returned `SemanticModel`
+  // surface exposes it as a plain `readonly` property without a setter.
+  let attachedScopes: ScopeResolutionIndexes | undefined;
+
+  const attachScopeIndexes = (indexes: ScopeResolutionIndexes): void => {
+    if (attachedScopes !== undefined) {
+      throw new Error(
+        'SemanticModel: scope indexes already attached. ' + 'Call `clear()` before re-attaching.',
+      );
+    }
+    attachedScopes = Object.freeze(indexes);
+  };
+
   // Cascade clear: single source of truth for "reset the entire model".
   // Wired into both `model.clear()` AND `model.symbols.clear()` so that a
   // caller holding only a SymbolTable reference can't leave the
@@ -166,6 +241,7 @@ export const createSemanticModel = (): MutableSemanticModel => {
     methods.clear();
     fields.clear();
     rawSymbols.clear();
+    attachedScopes = undefined;
   };
 
   // Writer-typed facade: exposes reads + add, but NO `clear` field.
@@ -188,6 +264,10 @@ export const createSemanticModel = (): MutableSemanticModel => {
     methods,
     fields,
     symbols,
+    get scopes() {
+      return attachedScopes;
+    },
     clear: cascadeClear,
+    attachScopeIndexes,
   };
 };

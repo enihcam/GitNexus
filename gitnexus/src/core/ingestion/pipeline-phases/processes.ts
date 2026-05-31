@@ -19,6 +19,7 @@ import { processProcesses, type ProcessDetectionResult } from '../process-proces
 import { generateId } from '../../../lib/utils.js';
 import { isDev } from '../utils/env.js';
 
+import { logger } from '../../logger.js';
 export interface ProcessesOutput {
   processResult: ProcessDetectionResult;
 }
@@ -40,7 +41,7 @@ export const processesPhase: PipelinePhase<ProcessesOutput> = {
 
     ctx.onProgress({
       phase: 'processes',
-      percent: 94,
+      percent: 99,
       message: 'Detecting execution flows...',
       stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: ctx.graph.nodeCount },
     });
@@ -55,7 +56,7 @@ export const processesPhase: PipelinePhase<ProcessesOutput> = {
       ctx.graph,
       communityResult.memberships,
       (message, progress) => {
-        const processProgress = 94 + progress * 0.05;
+        const processProgress = 99 + progress * 0.01;
         ctx.onProgress({
           phase: 'processes',
           percent: Math.round(processProgress),
@@ -67,7 +68,7 @@ export const processesPhase: PipelinePhase<ProcessesOutput> = {
     );
 
     if (isDev) {
-      console.log(
+      logger.info(
         `🔄 Process detection: ${processResult.stats.totalProcesses} processes found (${processResult.stats.crossCommunityCount} cross-community)`,
       );
     }
@@ -112,12 +113,15 @@ export const processesPhase: PipelinePhase<ProcessesOutput> = {
         }
         list.push(url);
       }
-      const toolsByFile = new Map<string, string[]>();
+      const toolsByHandlerId = new Map<string, string[]>();
+      const toolsWithoutHandlerByFile = new Map<string, string[]>();
       for (const td of toolDefs) {
-        let list = toolsByFile.get(td.filePath);
+        const key = td.handlerNodeId ?? td.filePath;
+        const targetMap = td.handlerNodeId ? toolsByHandlerId : toolsWithoutHandlerByFile;
+        let list = targetMap.get(key);
         if (!list) {
           list = [];
-          toolsByFile.set(td.filePath, list);
+          targetMap.set(key, list);
         }
         list.push(td.name);
       }
@@ -145,7 +149,9 @@ export const processesPhase: PipelinePhase<ProcessesOutput> = {
             linked++;
           }
         }
-        const toolNames = toolsByFile.get(entryFile);
+        const exactToolNames = toolsByHandlerId.get(proc.entryPointId);
+        const fallbackToolNames = toolsWithoutHandlerByFile.get(entryFile);
+        const toolNames = exactToolNames ?? fallbackToolNames;
         if (toolNames) {
           for (const toolName of toolNames) {
             const toolNodeId = generateId('Tool', toolName);
@@ -162,7 +168,7 @@ export const processesPhase: PipelinePhase<ProcessesOutput> = {
         }
       }
       if (isDev && linked > 0) {
-        console.log(`🔗 Linked ${linked} Route/Tool nodes to execution flows`);
+        logger.info(`🔗 Linked ${linked} Route/Tool nodes to execution flows`);
       }
     }
 

@@ -13,7 +13,14 @@
  * directly through the MCP Server's handler dispatch.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { createMCPServer } from '../../src/mcp/server.js';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import {
+  createMCPServer,
+  installSignalShutdown,
+  SHUTDOWN_EXIT_CODES,
+} from '../../src/mcp/server.js';
+import { GITNEXUS_TOOLS } from '../../src/mcp/tools.js';
 
 // ─── Mock backend ──────────────────────────────────────────────────
 
@@ -51,6 +58,28 @@ describe('createMCPServer', () => {
     const server = createMCPServer(backend);
     // The server has registered handlers — verify it was created without errors
     expect(server).toBeTruthy();
+  });
+
+  it('tools/list response includes tool annotations', async () => {
+    const backend = createMockBackend();
+    const server = createMCPServer(backend);
+    const client = new Client({ name: 'test-client', version: '0.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+    try {
+      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+      const response = await client.listTools();
+      expect(response.tools).toHaveLength(GITNEXUS_TOOLS.length);
+
+      for (const tool of response.tools) {
+        const definition = GITNEXUS_TOOLS.find((t) => t.name === tool.name)!;
+        expect(tool.annotations).toEqual(definition.annotations);
+      }
+    } finally {
+      await client.close();
+      await server.close();
+    }
   });
 });
 
@@ -98,5 +127,40 @@ describe('prompt registration', () => {
     // Creating the server registers all handlers including prompts
     const server = createMCPServer(backend);
     expect(server).toBeDefined();
+  });
+});
+
+// ─── Graceful shutdown signal handling (#1132) ────────────────────────
+
+describe('installSignalShutdown (#1132)', () => {
+  it('maps SIGINT→130 / SIGTERM→143 and never passes the signal name to shutdown', () => {
+    // Node invokes signal listeners with the signal NAME string as the first
+    // argument. The old code registered `shutdown` directly, so that string
+    // reached process.exit() and crashed with ERR_INVALID_ARG_TYPE. Reproduce
+    // that exact invocation and assert a numeric code is used instead.
+    const received: unknown[] = [];
+    let onSigint: ((...args: unknown[]) => void) | undefined;
+    let onSigterm: ((...args: unknown[]) => void) | undefined;
+
+    installSignalShutdown(
+      (code) => received.push(code),
+      (event, listener) => {
+        if (event === 'SIGINT') onSigint = listener;
+        if (event === 'SIGTERM') onSigterm = listener;
+      },
+    );
+
+    expect(onSigint).toBeTypeOf('function');
+    expect(onSigterm).toBeTypeOf('function');
+
+    // Invoke exactly as Node does — with the signal name string as the arg.
+    onSigint?.('SIGINT');
+    onSigterm?.('SIGTERM');
+
+    expect(received).toEqual([SHUTDOWN_EXIT_CODES.SIGINT, SHUTDOWN_EXIT_CODES.SIGTERM]);
+    expect(received).toEqual([130, 143]);
+    for (const code of received) {
+      expect(typeof code).toBe('number');
+    }
   });
 });
